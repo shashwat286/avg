@@ -30,14 +30,22 @@ def human_format_numbers(num, use_float=False):
         return '%.2f%s' % (num, ['', 'K', 'M', 'G', 'T', 'P'][magnitude])
     return '%d%s' % (num, ['', 'K', 'M', 'G', 'T', 'P'][magnitude])
 
+def set_threads(n=None):
+    if n is None:
+        n = os.cpu_count() or 10
+    os.environ['OMP_NUM_THREADS'] = str(n)
+    os.environ['MKL_NUM_THREADS'] = str(n)
+    os.environ['OPENBLAS_NUM_THREADS'] = str(n)
+    os.environ['VECLIB_MAXIMUM_THREADS'] = str(n)
+    os.environ['NUMEXPR_NUM_THREADS'] = str(n)
+    torch.set_num_threads(n)
+
 def set_one_thread():
     '''
     N.B: Pytorch over-allocates resources and hogs CPU, which makes experiments very slow!
     Set number of threads for pytorch to 1 to avoid this issue. This is a temporary workaround.
     '''
-    os.environ['OMP_NUM_THREADS'] = '1'
-    os.environ['MKL_NUM_THREADS'] = '1'
-    torch.set_num_threads(1)
+    set_threads(1)
 
 
 class Actor(nn.Module):
@@ -166,13 +174,18 @@ class AVG:
         self.steps += 1
 
 
-    def save(self, model_dir, unique_str):
+    def save(self, model_dir, unique_str, norm_env=None):
+        os.makedirs(model_dir, exist_ok=True)
         model = {
             "actor": self.actor.state_dict(),
             "critic": self.Q.state_dict(),
             "policy_opt": self.popt.state_dict(),
             "critic_opt": self.qopt.state_dict(),
         }
+        if norm_env is not None and hasattr(norm_env, "obs_rms"):
+            model["obs_mean"] = norm_env.obs_rms.mean
+            model["obs_var"] = norm_env.obs_rms.var
+            model["obs_count"] = norm_env.obs_rms.count
         torch.save(model, '%s/%s.pt' % (model_dir, unique_str))
 
 
@@ -181,10 +194,10 @@ def main(args):
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") + f"-{args.algo}-{args.env}_seed-{args.seed}"
 
     # Env
-    env = gym.make(args.env)
-    env = gym.wrappers.FlattenObservation(env)
-    env = NormalizeObservation(env)
-    env = ClipAction(env)
+    raw_env = gym.make(args.env)
+    flat_env = gym.wrappers.FlattenObservation(raw_env)
+    norm_env = NormalizeObservation(flat_env)
+    env = ClipAction(norm_env)
 
     #### Reproducibility
     env.reset(seed=args.seed)
@@ -193,6 +206,8 @@ def main(args):
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(args.seed)
     ####
 
     # Learner
@@ -221,7 +236,7 @@ def main(args):
             obs = next_obs
 
             if t % args.checkpoint == 0 and args.save_model:
-                agent.save(model_dir=args.results_dir, unique_str=f"{run_id}_model_{human_format_numbers(t)}")
+                agent.save(model_dir=args.results_dir, unique_str=f"{run_id}_model_{human_format_numbers(t)}", norm_env=norm_env)
 
             # Termination
             if terminated or truncated:
@@ -245,7 +260,7 @@ def main(args):
     
     # Save returns and args before exiting run
     if args.save_model:
-        agent.save(model_dir=args.results_dir, unique_str=f"{run_id}_model")
+        agent.save(model_dir=args.results_dir, unique_str=f"{run_id}_model", norm_env=norm_env)
 
     print("Run with id: {} took {:.3f}s!".format(run_id, time.time()-tic))
     
@@ -274,7 +289,9 @@ if __name__ == "__main__":
     # Miscellaneous
     parser.add_argument('--checkpoint', default=50000, type=int, help="Save plots and rets every checkpoint")
     parser.add_argument('--results_dir', default="./results", type=str, help="Location to store results")
-    parser.add_argument('--device', default="cpu", type=str)    
+    default_device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument('--device', default=default_device, type=str, help="Device to use: 'mps', 'cuda', or 'cpu'")    
+    parser.add_argument('--threads', default=1, type=int, help="Number of CPU cores/threads to use")
     parser.add_argument('--save_model', action='store_true', default=False)
     parser.add_argument('--n_eval', default=0, type=int, help="Number of eval episodes")
     args = parser.parse_args()
@@ -283,15 +300,22 @@ if __name__ == "__main__":
     args.betas = [args.beta1, 0.999]
 
     # CPU/GPU use for the run
-    if torch.cuda.is_available() and "cuda" in args.device:
+    if "cuda" in args.device and torch.cuda.is_available():
         args.device = torch.device(args.device)
+    elif ("mps" in args.device or args.device == "gpu") and torch.backends.mps.is_available():
+        args.device = torch.device("mps")
+    elif args.device == "cpu":
+        args.device = torch.device("cpu")
+    elif torch.backends.mps.is_available():
+        args.device = torch.device("mps")
     else:
         args.device = torch.device("cpu")    
 
     args.algo = "AVG"
     
-    # Start experiment
-    set_one_thread()
+    # Start experiment with specified CPU threads
+    set_threads(args.threads)
+    print(f"Running on Device: {args.device} | CPU Threads: {torch.get_num_threads()}")
     ep_steps, rets = main(args)
 
     # Save hyper-parameters and config info
